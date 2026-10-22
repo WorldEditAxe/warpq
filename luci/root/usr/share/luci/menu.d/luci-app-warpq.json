@@ -1,0 +1,14 @@
+{
+	"admin/services/warpq": {
+		"title": "Cloudflare WARP",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "warpq/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-warpq" ],
+			"uci": { "warpq": true }
+		}
+	}
+}

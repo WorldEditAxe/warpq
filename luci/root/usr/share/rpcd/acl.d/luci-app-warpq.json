@@ -1,0 +1,17 @@
+{
+	"luci-app-warpq": {
+		"description": "Grant access to the warpq tunnel",
+		"read": {
+			"ubus": {
+				"warpq": [ "status", "account" ]
+			},
+			"uci": [ "warpq" ]
+		},
+		"write": {
+			"ubus": {
+				"warpq": [ "start", "stop", "register" ]
+			},
+			"uci": [ "warpq" ]
+		}
+	}
+}

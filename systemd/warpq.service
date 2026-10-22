@@ -1,0 +1,34 @@
+[Unit]
+Description=warpq Cloudflare WARP tunnel (MASQUE over HTTP/2)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/warpq.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/warpq up -c /etc/warpq.json --secure
+# The daemon undoes its routing on SIGINT/SIGTERM. If it crashed or was
+# SIGKILLed instead, its policy rules would outlive it and steer traffic at a
+# missing table, so sweep them (and the device) on every stop. Harmless after a
+# clean exit, which has already removed them.
+ExecStopPost=/bin/sh -c 'ip link del warp0 2>/dev/null; for f in -4 -6; do for p in 32763 32764 32765; do while ip $f rule del priority $p 2>/dev/null; do :; done; done; done; true'
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+# Needs CAP_NET_ADMIN for the TUN device, addresses, routes, rules and SO_MARK.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

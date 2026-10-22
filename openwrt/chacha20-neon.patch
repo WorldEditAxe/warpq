@@ -1,0 +1,36 @@
+--- a/library/chacha20.c
++++ b/library/chacha20.c
+@@ -106,6 +106,10 @@
+  * \param initial_state The initial ChaCha20 state (key, nonce, counter).
+  * \param keystream     Generated keystream bytes are written to this buffer.
+  */
++#if defined(WARPQ_CHACHA20_NEON)
++#include "chacha20_neon.inc"
++#endif
++
+ static void chacha20_block(const uint32_t initial_state[16],
+                            unsigned char keystream[64])
+ {
+@@ -276,6 +280,22 @@
+             ctx->keystream_bytes_used = CHACHA20_COUNTER_EXHAUSTED;
+         }
+     }
++
++#if defined(WARPQ_CHACHA20_NEON)
++    /* Four blocks at a time while there is enough data left. The counter is
++     * advanced by four; the tail falls through to the scalar loop below. */
++    while (size >= 4U * CHACHA20_BLOCK_SIZE_BYTES) {
++        warpq_chacha20_4block_xor(ctx->state, input + offset, output + offset);
++        ctx->state[CHACHA20_CTR_INDEX] += 4U;
++
++        offset += 4U * CHACHA20_BLOCK_SIZE_BYTES;
++        size   -= 4U * CHACHA20_BLOCK_SIZE_BYTES;
++
++        if (ctx->state[CHACHA20_CTR_INDEX] == 0U) {
++            ctx->keystream_bytes_used = CHACHA20_COUNTER_EXHAUSTED;
++        }
++    }
++#endif
+ 
+     /* Process full blocks */
+     while (size >= CHACHA20_BLOCK_SIZE_BYTES) {

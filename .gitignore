@@ -1,0 +1,16 @@
+# build output
+*.o
+*.a
+/warpq
+/build-x64/
+/build-x64-work/
+/build-neon/
+
+# local secrets -- never commit
+PASSWD
+warpq.json
+
+# editor / OS
+.DS_Store
+.vscode/
+*.swp

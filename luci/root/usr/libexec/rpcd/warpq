@@ -1,0 +1,94 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+
+WARPQ=/usr/sbin/warpq
+CONFIG=/etc/warpq.json
+
+status_json() {
+	local out
+
+	out=$("$WARPQ" status -j 2>/dev/null)
+	if [ -z "$out" ]; then
+		json_init
+		json_add_string state "stopped"
+		json_add_boolean registered "$([ -f "$CONFIG" ] && echo 1 || echo 0)"
+		json_dump
+		return
+	fi
+	echo "${out%\}},\"registered\":$([ -f "$CONFIG" ] && echo true || echo false)}"
+}
+
+account_json() {
+	local line key value
+
+	json_init
+	"$WARPQ" account -c "$CONFIG" 2>/dev/null > /tmp/warpq-account.$$ || {
+		rm -f /tmp/warpq-account.$$
+		json_add_string error "account lookup failed"
+		json_dump
+		return
+	}
+	while read -r line; do
+		key=${line%% *}
+		value=${line#"$key"}
+		value=${value# }
+		[ -n "$key" ] && json_add_string "$key" "$value"
+	done < /tmp/warpq-account.$$
+	rm -f /tmp/warpq-account.$$
+	json_dump
+}
+
+case "$1" in
+list)
+	json_init
+	json_add_object status; json_close_object
+	json_add_object account; json_close_object
+	json_add_object start; json_close_object
+	json_add_object stop; json_close_object
+	json_add_object register; json_add_string name ""; json_close_object
+	json_dump
+	;;
+call)
+	case "$2" in
+	status)
+		status_json
+		;;
+	account)
+		account_json
+		;;
+	start)
+		json_init
+		if [ "$(uci -q get warpq.config.enabled)" = "1" ]; then
+			/etc/init.d/warpq start >/dev/null 2>&1
+			json_add_string result "ok"
+		else
+			json_add_string result "disabled"
+		fi
+		json_dump
+		;;
+	stop)
+		/etc/init.d/warpq stop >/dev/null 2>&1
+		json_init; json_add_string result "ok"; json_dump
+		;;
+	register)
+		read -r input
+		json_load "$input" 2>/dev/null
+		json_get_var name name
+		[ -n "$name" ] || name=$(cat /proc/sys/kernel/hostname)
+		json_init
+		if [ -f "$CONFIG" ]; then
+			json_add_string result "exists"
+		elif "$WARPQ" register -c "$CONFIG" -n "$name" >/tmp/warpq-register.log 2>&1; then
+			json_add_string result "ok"
+		else
+			json_add_string result "error"
+			json_add_string message "$(tail -n 2 /tmp/warpq-register.log)"
+		fi
+		json_dump
+		;;
+	*)
+		json_init; json_add_string error "unknown method"; json_dump
+		;;
+	esac
+	;;
+esac
