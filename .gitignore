@@ -5,6 +5,8 @@
 /build-x64/
 /build-x64-work/
 /build-neon/
+/build-release-work/
+/dist/
 
 # local secrets -- never commit
 PASSWD

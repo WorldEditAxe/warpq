@@ -1,4 +1,4 @@
-# warpq (C)
+# warpq
 
 A mbedTLS-only Cloudflare WARP client, originally made for OpenWrt.
 
@@ -15,6 +15,28 @@ For OpenWRT:
 cd ~/openwrt-sdk-24.10-ath79
 make package/warpq/compile V=s
 ```
+
+### Release binaries
+
+`./openwrt/build-release.sh` cross-builds fully static binaries (musl, mbedTLS
+linked in) with zig for every common Linux architecture, into `dist/` with a
+`SHA256SUMS`. Pass target names to build only some of them.
+
+| Name | Runs on |
+|------|---------|
+| `x86_64` | PCs, servers, OpenWrt x86/64 |
+| `i686` | 32-bit PCs, OpenWrt x86/generic |
+| `aarch64` | Pi 3+, MediaTek Filogic, Rockchip, ARM servers (NEON ChaCha20) |
+| `armv7` | ARMv7 with VFPv3-D16 (mvebu, Cortex-A9 without NEON) |
+| `armv7-neon` | ipq40xx, ipq806x, Pi 2, Cortex-A7/A15 (NEON ChaCha20) |
+| `armv6` | Pi 1, Pi Zero |
+| `armv5` | kirkwood and other ARMv5TE |
+| `mips` | ath79, lantiq (big-endian MIPS32r2, soft-float) |
+| `mipsel` | ramips: MT7621, MT7620, MT76x8 |
+| `mips64` | octeon |
+| `riscv64` | RV64GC boards |
+| `ppc64le` | POWER8 and later |
+| `loongarch64` | Loongson 3A5000 and later |
 
 ### With ECH/"stealth" mode (`--secure`)
 
