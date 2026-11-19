@@ -67,14 +67,17 @@ int tun_open(char *name, size_t name_len)
 	return tun_open_flags(name, name_len, 0);
 }
 
-int tun_open_queue(char *name, size_t name_len, size_t *vnet_hdr_len)
+int tun_open_queue(char *name, size_t name_len, size_t *vnet_hdr_len, int create)
 {
+	/* A second `warpq up` would otherwise attach a queue to the running
+	 * device and go on to replace its routing rules. */
+	short excl = create ? IFF_TUN_EXCL : 0;
 	int fd;
 
 	if (vnet_hdr_len) {
 		unsigned size = (unsigned)sizeof(struct virtio_net_hdr);
 
-		fd = tun_open_flags(name, name_len, IFF_MULTI_QUEUE | IFF_VNET_HDR);
+		fd = tun_open_flags(name, name_len, IFF_MULTI_QUEUE | IFF_VNET_HDR | excl);
 		if (fd >= 0) {
 			if (!ioctl(fd, TUNSETVNETHDRSZ, &size)) {
 				/* Have TCP handed over in segments of up to
@@ -88,10 +91,15 @@ int tun_open_queue(char *name, size_t name_len, size_t *vnet_hdr_len)
 				return fd;
 			}
 			close(fd);
+		} else if (errno == EBUSY) {
+			return fail("TUN device already exists (is warpq already running?)");
 		}
 		*vnet_hdr_len = 0;
 	}
-	return tun_open_flags(name, name_len, IFF_MULTI_QUEUE);
+	fd = tun_open_flags(name, name_len, IFF_MULTI_QUEUE | excl);
+	if (fd < 0 && errno == EBUSY)
+		return fail("TUN device already exists (is warpq already running?)");
+	return fd;
 }
 
 int tun_nonblocking(int fd)

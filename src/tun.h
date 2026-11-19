@@ -11,7 +11,8 @@ int tun_open(char *name, size_t name_len);
 /* vnet_hdr_len, when not NULL, asks for IFF_VNET_HDR and reports the virtio
  * header size the device ended up using -- 0 if the kernel would not give it,
  * in which case packets are written one at a time as before. */
-int tun_open_queue(char *name, size_t name_len, size_t *vnet_hdr_len);
+/* create, when set, refuses a device that already exists (IFF_TUN_EXCL). */
+int tun_open_queue(char *name, size_t name_len, size_t *vnet_hdr_len, int create);
 int tun_set_mtu(const char *name, int mtu);
 int tun_set_ipv4(const char *name, const char *addr);
 int tun_set_ipv6(const char *name, const char *addr);

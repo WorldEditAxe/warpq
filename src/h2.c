@@ -366,6 +366,7 @@ struct session {
 	long long send_window;
 	long long stream_window;
 	unsigned unacked;
+	const tunnel_opts *opts;
 };
 
 static void chan_init(struct chan *c)
@@ -716,6 +717,8 @@ static ssize_t parse_frames(struct session *s, const uint8_t *data, size_t total
 					 "%s", tls_ciphersuite(&s->tls));
 				fprintf(stderr, "tunnel up: CONNECT accepted (HTTP/2, %s, %s)\n",
 					tls_ciphersuite(&s->tls), tls_engine(&s->tls));
+				if (s->opts->on_connected)
+					s->opts->on_connected(s->opts->on_connected_arg, 1);
 			} else if (status > 0) {
 				char detail[16];
 
@@ -739,8 +742,20 @@ static ssize_t parse_frames(struct session *s, const uint8_t *data, size_t total
 					return fail("out of memory%s", NULL);
 			}
 			break;
-		case FRAME_GOAWAY:
-			return fail("proxy sent GOAWAY%s", NULL);
+		case FRAME_GOAWAY: {
+			char detail[48];
+			unsigned last = len >= 4 ? ((unsigned)payload[0] << 24 |
+						    (unsigned)payload[1] << 16 |
+						    (unsigned)payload[2] << 8 |
+						    payload[3]) & 0x7fffffff : 0;
+			unsigned code = len >= 8 ? ((unsigned)payload[4] << 24 |
+						    (unsigned)payload[5] << 16 |
+						    (unsigned)payload[6] << 8 | payload[7]) : 0;
+
+			snprintf(detail, sizeof(detail), "error %u, last stream %u",
+				 code, last);
+			return fail("proxy sent GOAWAY (%s)", detail);
+		}
 		case FRAME_RST_STREAM: {
 			char detail[16];
 			unsigned code = len >= 4 ? ((unsigned)payload[0] << 24 |
@@ -789,6 +804,10 @@ struct pipeline {
 	int tun_fd;
 	volatile int done;
 	int rc;
+	/* error_buf is per thread, so a failure on the processing or reader
+	 * thread is copied here for h2_run to report as its own. */
+	char proc_error[256];
+	char tun_error[256];
 	pthread_t proc;
 	pthread_t tun;
 };
@@ -804,6 +823,7 @@ static void *proc_main(void *arg)
 		if (idx < 0)
 			break;
 		if (take_frames(pl->s, pl->chan->buf[idx], pl->chan->len[idx])) {
+			snprintf(pl->proc_error, sizeof(pl->proc_error), "%s", error_buf);
 			pl->rc = -1;
 			chan_release(pl->chan);
 			break;
@@ -814,6 +834,7 @@ static void *proc_main(void *arg)
 		 * record, which is no coalescing at all. */
 		if (!chan_ready(pl->chan) && gro_flush(pl->s->gro)) {
 			pl->rc = fail("failed to write to the tunnel device%s", NULL);
+			snprintf(pl->proc_error, sizeof(pl->proc_error), "%s", error_buf);
 			break;
 		}
 	}
@@ -858,6 +879,7 @@ static void *tun_main(void *arg)
 		free(packet);
 		free(scratch);
 		pl->rc = fail("out of memory%s", NULL);
+		snprintf(pl->tun_error, sizeof(pl->tun_error), "%s", error_buf);
 		pl->done = 1;
 		return NULL;
 	}
@@ -886,6 +908,8 @@ static void *tun_main(void *arg)
 					      queue_packet, &batch)
 				  : queue_packet(&batch, packet, (size_t)len);
 			if (rc) {
+				snprintf(pl->tun_error, sizeof(pl->tun_error), "%s",
+					 error_buf[0] ? error_buf : "could not packetize a TUN read");
 				pl->rc = -1;
 				pl->done = 1;
 				break;
@@ -921,6 +945,7 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 	memset(&s, 0, sizeof(s));
 	s.status = status;
 	s.tun_fd = tun_fd;
+	s.opts = opts;
 	s.vnet_hdr_len = opts->vnet_hdr_len;
 	s.gro = gro_new(tun_fd, opts->vnet_hdr_len, (size_t)opts->mtu);
 	if (!s.gro)
@@ -992,6 +1017,7 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 		pl.tun_fd = tun_fd;
 		pl.done = 0;
 		pl.rc = 0;
+		pl.proc_error[0] = pl.tun_error[0] = 0;
 
 		if (pthread_create(&pl.proc, NULL, proc_main, &pl)) {
 			rc = fail("could not start the processing thread%s", NULL);
@@ -1097,8 +1123,11 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 			chan_close(&ch);
 			pthread_join(pl.proc, NULL);
 			pthread_join(pl.tun, NULL);
-			if (!rc && pl.rc)
+			if (!rc && pl.rc) {
 				rc = pl.rc;
+				snprintf(error_buf, sizeof(error_buf), "%s",
+					 pl.proc_error[0] ? pl.proc_error : pl.tun_error);
+			}
 		}
 	}
 

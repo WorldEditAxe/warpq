@@ -37,7 +37,7 @@ static const char USAGE[] =
 "  -s SOCK      control socket path (default: " CTL_DEFAULT_PATH ")\n"
 "  --no-ctl     do not create a control socket\n"
 "  -t N         tunnel workers, one TLS session and TUN queue each\n"
-"               (default: one per CPU core, max 8)\n"
+"               (default: half the CPU cores, at least 2, max 8)\n"
 "  --cipher C   restrict the TLS AEAD: auto (default), chacha or aes.\n"
 "               the endpoint picks chacha unless only aes is offered\n"
 "  --sni NAME   send NAME as the tunnel's SNI instead (the endpoint ignores\n"
@@ -203,40 +203,61 @@ struct worker {
 	volatile sig_atomic_t *stop;
 	struct warp_status *status;
 	int index;
+	volatile int was_up;   /* the last session got its CONNECT accepted */
 };
 
 #define MAX_WORKERS 8
 
+static void on_connected(void *arg, int connected)
+{
+	struct worker *w = arg;
+
+	w->was_up = connected;
+}
+
+/* While a worker is between sessions, flows the kernel hashes to its TUN queue
+ * have nowhere to go, so a session that was working is redialled at once. The
+ * flows it carried cannot be saved either way -- the endpoint ties each flow to
+ * the connection it arrived on -- but new ones should not wait. A session that
+ * never came up, or went down within seconds, waits a second before the next
+ * try, so an unreachable or refusing endpoint is not hammered. */
 static void *worker_main(void *arg)
 {
 	struct worker *w = arg;
 
 	while (!*w->stop) {
+		time_t began = time(NULL);
+
+		w->was_up = 0;
 		if (h2_run(w->config, w->tun_fd, &w->opts, w->stop, w->status) &&
 		    !*w->stop)
 			fprintf(stderr, "worker %d down: %s\n", w->index, h2_error());
 		if (!*w->stop) {
 			__atomic_fetch_add(&w->status->reconnects, 1, __ATOMIC_RELAXED);
-			sleep(1);
+			if (!w->was_up || time(NULL) - began < 5)
+				sleep(1);
 		}
 	}
 	return NULL;
 }
 
-/* Two by default. Each extra worker adds a TLS session, which lifts aggregate
- * throughput when several flows are in the air but costs a single flow some
- * speed -- a flow is hashed to one TUN queue, so it can only ever use one
- * worker, and the idle ones still cost cache and scheduling. Measured on a
- * 4-core ipq40xx: one worker 29.6 Mbit/s single / 34.4 aggregate, two 29.4 /
- * 51.8, four 23.2 / 58.1. Two is the point where aggregate improves without
- * the single-flow loss. Raise it with -t if the traffic is mostly parallel. */
+/* Half the cores, but at least two where there are two to run on. Each extra
+ * worker adds a TLS session, which lifts aggregate throughput when several
+ * flows are in the air but costs a single flow some speed -- a flow is hashed
+ * to one TUN queue, so it can only ever use one worker, and the idle ones
+ * still cost cache and scheduling. Measured on a 4-core ipq40xx: one worker
+ * 29.6 Mbit/s single / 34.4 aggregate, two 29.4 / 51.8, four 23.2 / 58.1. Each
+ * worker also runs three threads of its own (TLS, processing, TUN reader), so
+ * one per core would oversubscribe; half leaves the rest of each core pair to
+ * them. Override it with -t. */
 static int default_workers(void)
 {
 	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	long half = n / 2, least = n < 2 ? n : 2;
 
-	if (n < 2)
+	if (n < 1)
 		return 1;
-	return 2;
+	return (int)(half > least ? half : least);
 }
 
 static int cmd_up(const char *path, const char *iface, int mtu, int port,
@@ -291,7 +312,7 @@ static int cmd_up(const char *path, const char *iface, int mtu, int port,
 	/* Always take a multi-queue device: it carries the virtio header that
 	 * lets inbound segments be coalesced, and extra queues can be attached
 	 * later without recreating it. */
-	tun_fd = tun_open_queue(name, sizeof(name), &vnet_hdr_len);
+	tun_fd = tun_open_queue(name, sizeof(name), &vnet_hdr_len, 1);
 	if (tun_fd < 0) {
 		fprintf(stderr, "error: %s\n", tun_error());
 		config_free(&config);
@@ -363,6 +384,8 @@ static int cmd_up(const char *path, const char *iface, int mtu, int port,
 		/* Only worker 0 answers the control socket; the others must not
 		 * poll the same listening fd or they would race on accept(). */
 		pool[i].opts.ctl_fd = i == 0 ? ctl_fd : -1;
+		pool[i].opts.on_connected = on_connected;
+		pool[i].opts.on_connected_arg = &pool[i];
 
 		if (i == 0) {
 			pool[i].tun_fd = tun_fd;
@@ -373,7 +396,7 @@ static int cmd_up(const char *path, const char *iface, int mtu, int port,
 			size_t queue_vnet = 0;
 
 			pool[i].tun_fd = tun_open_queue(queue_name, sizeof(queue_name),
-							vnet_hdr_len ? &queue_vnet : NULL);
+							vnet_hdr_len ? &queue_vnet : NULL, 0);
 			if (pool[i].tun_fd < 0) {
 				fprintf(stderr, "warning: only %d worker(s): %s\n",
 					i, tun_error());

@@ -17,6 +17,10 @@ typedef struct {
 	int secure;            /* hide the endpoint name: send no SNI (see h2.c) */
 	const char *sni;       /* SNI to send instead; overrides secure when set */
 	int tls_engine;        /* TLS_ENGINE_*: who takes the record layer (tls_offload) */
+	/* Called with 1 from the processing thread once CONNECT is accepted,
+	 * so the caller knows the session worked before it ended. */
+	void (*on_connected)(void *arg, int connected);
+	void *on_connected_arg;
 } tunnel_opts;
 
 int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
