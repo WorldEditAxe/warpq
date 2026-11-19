@@ -40,6 +40,11 @@ static const char USAGE[] =
 "               (default: one per CPU core, max 8)\n"
 "  --cipher C   restrict the TLS AEAD: auto (default), chacha or aes.\n"
 "               the endpoint picks chacha unless only aes is offered\n"
+"  --sni NAME   send NAME as the tunnel's SNI instead (the endpoint ignores\n"
+"               it and is still verified by its pinned key)\n"
+"  --tls-engine E  who encrypts the tunnel after the handshake: auto\n"
+"               (default: the kernel's TLS layer if loaded, else warpq's\n"
+"               SIMD ChaCha20-Poly1305, else mbedTLS), warpq or mbedtls\n"
 "\n"
 "COMMON:\n"
 "  -c FILE      config file (default: /etc/warpq.json)\n"
@@ -236,14 +241,15 @@ static int default_workers(void)
 
 static int cmd_up(const char *path, const char *iface, int mtu, int port,
 		  int use_ipv6, int addressed, int routed, const char *ctl_path,
-		  const char *cipher, int workers, int secure)
+		  const char *cipher, int workers, int secure, const char *sni,
+		  const char *engine)
 {
 	warp_config config;
 	struct warp_status status;
 	struct worker pool[MAX_WORKERS];
 	char name[32];
 	int tun_fd, ctl_fd = -1, have_v6 = 0, rc = 0;
-	int started = 0, i;
+	int started = 0, i, tls_engine_choice = TLS_ENGINE_AUTO;
 	size_t vnet_hdr_len = 0;
 
 	if (workers < 1)
@@ -254,6 +260,15 @@ static int cmd_up(const char *path, const char *iface, int mtu, int port,
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 	signal(SIGPIPE, SIG_IGN);
+
+	if (!strcmp(engine, "warpq"))
+		tls_engine_choice = TLS_ENGINE_WARPQ;
+	else if (!strcmp(engine, "mbedtls"))
+		tls_engine_choice = TLS_ENGINE_MBEDTLS;
+	else if (strcmp(engine, "auto")) {
+		fprintf(stderr, "error: --tls-engine takes auto, warpq or mbedtls\n");
+		return 1;
+	}
 
 	if (!strcmp(cipher, "chacha"))
 		tls_prefer_cipher(TLS_CIPHER_CHACHA);
@@ -343,6 +358,8 @@ static int cmd_up(const char *path, const char *iface, int mtu, int port,
 		pool[i].opts.mark = routed ? WARPQ_MARK : 0;
 		pool[i].opts.vnet_hdr_len = vnet_hdr_len;
 		pool[i].opts.secure = secure;
+		pool[i].opts.sni = sni;
+		pool[i].opts.tls_engine = tls_engine_choice;
 		/* Only worker 0 answers the control socket; the others must not
 		 * poll the same listening fd or they would race on accept(). */
 		pool[i].opts.ctl_fd = i == 0 ? ctl_fd : -1;
@@ -442,7 +459,9 @@ int main(int argc, char **argv)
 			      atoi(option(argc, argv, "-t", "0")) > 0
 				      ? atoi(option(argc, argv, "-t", "0"))
 				      : default_workers(),
-			      flag(argc, argv, "--secure"));
+			      flag(argc, argv, "--secure"),
+			      option(argc, argv, "--sni", NULL),
+			      option(argc, argv, "--tls-engine", "auto"));
 	}
 	if (!strcmp(command, "status"))
 		return ctl_request(option(argc, argv, "-s", CTL_DEFAULT_PATH),

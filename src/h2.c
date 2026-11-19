@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include "ctl.h"
 #include "gro.h"
+#include "gso.h"
 #include "tlsx.h"
 #include "util.h"
 
@@ -350,6 +352,11 @@ struct session {
 	/* outbox is filled by the processing thread and drained by the TLS
 	 * thread, so it is the one piece of shared mutable state. */
 	pthread_mutex_t outbox_lock;
+	/* Kicked when the outbox gains something worth sending while the TLS
+	 * thread sleeps (see wake()). kicked is 0 only while it is asleep with
+	 * nobody having kicked yet; guarded by outbox_lock. */
+	int wake_fd;
+	int kicked;
 	struct buf sending;
 	int connected;
 	int requested;
@@ -442,6 +449,30 @@ static void chan_release(struct chan *c)
 	pthread_mutex_unlock(&c->lock);
 }
 
+/* The TLS thread sleeps in poll() on the socket, asking for POLLOUT only if
+ * the outbox already held something when it went to sleep. Bytes another
+ * thread queues after that -- a TUN packet, a TCP ACK, a WINDOW_UPDATE --
+ * would sit there until the endpoint happened to send something or the poll
+ * timed out, adding up to 20 ms to every quiet-link packet. So a thread
+ * queueing such bytes kicks this eventfd -- but only while the TLS thread is
+ * asleep, and only the first to find it so. An awake TLS thread looks at the
+ * outbox again before it sleeps, so kicking it then would only buy a spurious
+ * wakeup and a smaller record.
+ *
+ * Every kick costs the TLS thread a wakeup and a small record of its own, so
+ * only what is waiting on it kicks: a burst of TUN packets (once, after the
+ * burst) and control replies. WINDOW_UPDATEs do not -- the 8 MiB window is
+ * far from running out by the time the next flush carries them, and kicking
+ * for them cost about a tenth of download throughput. */
+static void wake(struct session *s)
+{
+	uint64_t one = 1;
+
+	if (write(s->wake_fd, &one, sizeof(one)) < 0) {
+		/* counter saturated or fd gone: the poll timeout still covers it */
+	}
+}
+
 static size_t frame_header(uint8_t *out, uint8_t kind, uint8_t flags, uint32_t stream, size_t len)
 {
 	out[0] = (uint8_t)(len >> 16);
@@ -460,14 +491,18 @@ static int queue_frame(struct session *s, uint8_t kind, uint8_t flags, uint32_t 
 		       const void *payload, size_t len)
 {
 	uint8_t header[9];
-	int rc;
+	int rc, kick = 0;
 
 	frame_header(header, kind, flags, stream, len);
 	pthread_mutex_lock(&s->outbox_lock);
 	rc = buf_append(&s->outbox, header, sizeof(header));
 	if (!rc && len)
 		rc = buf_append(&s->outbox, payload, len);
+	if (!rc && kind != FRAME_WINDOW_UPDATE && !s->kicked)
+		kick = s->kicked = 1;
 	pthread_mutex_unlock(&s->outbox_lock);
+	if (kick)
+		wake(s);
 	return rc;
 }
 
@@ -505,26 +540,34 @@ static int flush(struct session *s)
 static size_t parse_capsules(struct session *s, const uint8_t *data, size_t len)
 {
 	size_t pos = 0;
+	unsigned long long packets = 0, bytes = 0;
 
+	/* Counted locally and published once per call: the counters are 64-bit
+	 * and shared by every worker, and on 32-bit MIPS each atomic add on them
+	 * is a libatomic call taking a global lock. */
 	for (;;) {
 		uint64_t kind, capsule_len;
 		size_t type_len, len_len, start, end, left = len - pos;
 
-		if (get_varint(data + pos, left, &kind, &type_len))
-			return pos;
-		if (get_varint(data + pos + type_len, left - type_len, &capsule_len, &len_len))
-			return pos;
+		if (get_varint(data + pos, left, &kind, &type_len) ||
+		    get_varint(data + pos + type_len, left - type_len, &capsule_len, &len_len))
+			break;
 		start = type_len + len_len;
 		end = start + (size_t)capsule_len;
 		if (left < end)
-			return pos;
+			break;
 		if (kind == CAPSULE_DATAGRAM) {
 			gro_push(s->gro, data + pos + start, (size_t)capsule_len);
-			COUNT_ADD(s->status->rx_packets, 1);
-			COUNT_ADD(s->status->rx_bytes, capsule_len);
+			packets++;
+			bytes += capsule_len;
 		}
 		pos += end;
 	}
+	if (packets) {
+		COUNT_ADD(s->status->rx_packets, packets);
+		COUNT_ADD(s->status->rx_bytes, bytes);
+	}
+	return pos;
 }
 
 /* Feed a DATA payload through the capsule parser, buffering only a partial
@@ -547,7 +590,11 @@ static int take_capsules(struct session *s, const uint8_t *payload, size_t len)
 	return 0;
 }
 
-static int send_packet(struct session *s, const uint8_t *packet, size_t len)
+/* Returns 1 if the packet was queued, 0 if flow control dropped it, -1 on
+ * error. The caller does the counting (see parse_capsules for why), and the
+ * kicking: *kick is set if the TLS thread needs one (see wake()). */
+static int send_packet(struct session *s, const uint8_t *packet, size_t len,
+		       int *kick)
 {
 	uint8_t capsule[16];
 	size_t header_len = 0;
@@ -565,6 +612,8 @@ static int send_packet(struct session *s, const uint8_t *packet, size_t len)
 	}
 	s->send_window -= cost;
 	s->stream_window -= cost;
+	if (!s->kicked)
+		*kick = s->kicked = 1;
 
 	{
 		uint8_t *out = buf_reserve(&s->outbox, 9 + header_len + len);
@@ -576,11 +625,9 @@ static int send_packet(struct session *s, const uint8_t *packet, size_t len)
 		frame_header(out, FRAME_DATA, 0, STREAM_ID, header_len + len);
 		memcpy(out + 9, capsule, header_len);
 		memcpy(out + 9 + header_len, packet, len);
-		COUNT_ADD(s->status->tx_packets, 1);
-		COUNT_ADD(s->status->tx_bytes, len);
 	}
 	pthread_mutex_unlock(&s->outbox_lock);
-	return 0;
+	return 1;
 }
 
 /* Parse HTTP/2 frames straight out of the caller's bytes and return how many
@@ -667,8 +714,8 @@ static ssize_t parse_frames(struct session *s, const uint8_t *data, size_t total
 				COUNT_ADD(s->status->connected, 1);
 				snprintf(s->status->cipher, sizeof(s->status->cipher),
 					 "%s", tls_ciphersuite(&s->tls));
-				fprintf(stderr, "tunnel up: CONNECT accepted (HTTP/2, %s)\n",
-					tls_ciphersuite(&s->tls));
+				fprintf(stderr, "tunnel up: CONNECT accepted (HTTP/2, %s, %s)\n",
+					tls_ciphersuite(&s->tls), tls_engine(&s->tls));
 			} else if (status > 0) {
 				char detail[16];
 
@@ -774,15 +821,42 @@ static void *proc_main(void *arg)
 	return NULL;
 }
 
+struct tun_batch {
+	struct session *s;
+	unsigned long long packets, bytes;
+	int kick;
+};
+
+static int queue_packet(void *arg, const uint8_t *packet, size_t len)
+{
+	struct tun_batch *b = arg;
+	int sent = send_packet(b->s, packet, len, &b->kick);
+
+	if (sent < 0)
+		return -1;
+	if (sent) {
+		b->packets++;
+		b->bytes += len;
+	}
+	return 0;
+}
+
 /* Feeds the outbox from the TUN device. */
 static void *tun_main(void *arg)
 {
 	struct pipeline *pl = arg;
 	size_t vnet = pl->s->vnet_hdr_len;
-	size_t cap = (size_t)pl->opts->mtu + 64 + vnet;
+	/* with a virtio header the device may hand over 64 KiB at once */
+	size_t cap = (vnet ? 65536 : (size_t)pl->opts->mtu + 64) + vnet;
 	uint8_t *packet = malloc(cap);
+	uint8_t *scratch = vnet ? malloc(cap) : NULL;
+	struct tun_batch batch;
 
-	if (!packet) {
+	memset(&batch, 0, sizeof(batch));
+	batch.s = pl->s;
+	if (!packet || (vnet && !scratch)) {
+		free(packet);
+		free(scratch);
 		pl->rc = fail("out of memory%s", NULL);
 		pl->done = 1;
 		return NULL;
@@ -799,19 +873,36 @@ static void *tun_main(void *arg)
 		if (!__atomic_load_n(&pl->s->connected, __ATOMIC_RELAXED))
 			continue;
 
+		/* Drain the burst before kicking the TLS thread, so it takes
+		 * the lot in one record instead of waking for the first packet
+		 * and coming back for the rest. */
 		for (;;) {
 			ssize_t len = read(pl->tun_fd, packet, cap);
+			int rc;
 
 			if (len <= (ssize_t)vnet)
 				break;
-			if (send_packet(pl->s, packet + vnet, (size_t)len - vnet)) {
+			rc = vnet ? gso_split(packet, (size_t)len, vnet, scratch, cap,
+					      queue_packet, &batch)
+				  : queue_packet(&batch, packet, (size_t)len);
+			if (rc) {
 				pl->rc = -1;
 				pl->done = 1;
 				break;
 			}
 		}
+		if (batch.kick) {
+			wake(pl->s);
+			batch.kick = 0;
+		}
+		if (batch.packets) {
+			COUNT_ADD(pl->s->status->tx_packets, batch.packets);
+			COUNT_ADD(pl->s->status->tx_bytes, batch.bytes);
+			batch.packets = batch.bytes = 0;
+		}
 	}
 	free(packet);
+	free(scratch);
 	return NULL;
 }
 
@@ -842,8 +933,11 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 	 * (config->spki), not by name, so secure mode drops the SNI entirely: the
 	 * endpoint still answers a nameless handshake with the pinned certificate,
 	 * and the real host name never appears on the wire. Otherwise SNI carries
-	 * the usual decoy name, which the endpoint also ignores. */
-	if (tls_client(&s.tls, host, opts->port, opts->secure ? NULL : SNI, "h2",
+	 * the usual decoy name, which the endpoint also ignores. --sni replaces
+	 * either with a name of the user's choosing, for networks that reset
+	 * handshakes naming the endpoint and also those naming nothing. */
+	if (tls_client(&s.tls, host, opts->port,
+		       opts->sni ? opts->sni : opts->secure ? NULL : SNI, "h2",
 		       config->key_der, config->key_len,
 		       config->spki, config->spki_len, opts->mark))
 		return fail("%s", tls_error());
@@ -851,9 +945,16 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 		tls_close(&s.tls);
 		return fail("%s", tls_error());
 	}
+	tls_offload(&s.tls, opts->tls_engine);
+	s.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (s.wake_fd < 0) {
+		tls_close(&s.tls);
+		return fail("could not create the wakeup eventfd%s", NULL);
+	}
 
 	chan_init(&ch);
 	pthread_mutex_init(&s.outbox_lock, NULL);
+	s.kicked = 1;
 
 #define PUT_SETTING(id, value)                                                 \
 	do {                                                                   \
@@ -901,7 +1002,7 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 			rc = fail("could not start the tunnel reader%s", NULL);
 		} else {
 			while (!rc && !*stop && !pl.done) {
-				struct pollfd fds[2];
+				struct pollfd fds[3];
 				int count, pending;
 
 				if (flush(&s)) {
@@ -949,24 +1050,45 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 				if (rc)
 					break;
 
+				/* About to sleep: from here a kick is
+				 * wanted, unless POLLOUT will wake us for
+				 * the outbox anyway. */
 				pthread_mutex_lock(&s.outbox_lock);
 				pending = BUF_LEN(&s.outbox) != 0;
+				if (!pending)
+					s.kicked = 0;
 				pthread_mutex_unlock(&s.outbox_lock);
 
 				fds[0].fd = s.tls.fd;
 				fds[0].events = POLLIN |
 						((pending || BUF_LEN(&s.sending)) ? POLLOUT : 0);
 				fds[0].revents = 0;
-				count = 1;
+				fds[1].fd = s.wake_fd;
+				fds[1].events = POLLIN;
+				fds[1].revents = 0;
+				count = 2;
 				if (opts->ctl_fd >= 0) {
-					fds[1].fd = opts->ctl_fd;
-					fds[1].events = POLLIN;
-					fds[1].revents = 0;
-					count = 2;
+					fds[2].fd = opts->ctl_fd;
+					fds[2].events = POLLIN;
+					fds[2].revents = 0;
+					count = 3;
 				}
 				poll(fds, (nfds_t)count, 20);
+				pthread_mutex_lock(&s.outbox_lock);
+				s.kicked = 1;
+				pthread_mutex_unlock(&s.outbox_lock);
 
-				if (count == 2 && (fds[1].revents & POLLIN) &&
+				/* Reset before the flush at the top of the
+				 * loop, so a kick landing after it is not
+				 * lost. */
+				if (fds[1].revents & POLLIN) {
+					uint64_t kicks;
+
+					if (read(s.wake_fd, &kicks, sizeof(kicks)) < 0) {
+						/* already reset: nothing to do */
+					}
+				}
+				if (count == 3 && (fds[2].revents & POLLIN) &&
 				    ctl_serve(opts->ctl_fd, status))
 					*stop = 1;
 			}
@@ -984,6 +1106,7 @@ int h2_run(const warp_config *config, int tun_fd, const tunnel_opts *opts,
 		COUNT_SUB(status->connected, 1);
 	gro_free(s.gro);
 	chan_destroy(&ch);
+	close(s.wake_fd);
 	pthread_mutex_destroy(&s.outbox_lock);
 	buf_free(&s.sending);
 	buf_free(&s.outbox);

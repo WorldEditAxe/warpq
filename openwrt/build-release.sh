@@ -13,6 +13,8 @@
 # OpenWrt mbedtls_config.h -- see build-x64.sh for why the config has to match.
 # neon=1 builds mbedTLS with the 4-block NEON ChaCha20 (chacha20_neon.inc);
 # kuser=1 links arm-kuser-atomics.c, for cores without ldrex/strex.
+# zig's v7a feature brings NEON with it, hence the explicit -neon on armv7:
+# without it the compiler (and aead.c) would use NEON on cores that lack it.
 #
 # The binaries are fully static against musl, so one runs on any Linux of its
 # architecture whatever the distribution's libc; the soft-float targets also
@@ -34,7 +36,7 @@ TARGETS='
 x86_64         x86_64-linux-musl        baseline             0     0      PCs, servers, OpenWrt x86/64
 i686           x86-linux-musl           i686                 0     0      32-bit PCs, OpenWrt x86/generic
 aarch64        aarch64-linux-musl       baseline             1     0      Pi 3+, filogic, rockchip, ARM servers
-armv7          arm-linux-musleabihf     generic+v7a+vfp3d16  0     0      mvebu, Cortex-A9 without NEON
+armv7          arm-linux-musleabihf     generic+v7a+vfp3d16-neon 0  0      mvebu, Cortex-A9 without NEON
 armv7-neon     arm-linux-musleabihf     generic+v7a+neon     1     0      ipq40xx, ipq806x, Pi 2, Cortex-A7/A15
 armv6          arm-linux-musleabihf     arm1176jzf_s         0     0      Pi 1, Pi Zero
 armv5          arm-linux-musleabi       arm926ej_s           0     1      kirkwood, other ARMv5TE

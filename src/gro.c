@@ -28,8 +28,8 @@ struct gro {
 	size_t payload_len;
 	size_t payload_cap;
 
-	uint8_t *out;            /* vnet hdr + headers + payload */
-	size_t out_cap;
+	/* vnet hdr + headers; the payload goes out from its own buffer */
+	uint8_t out[sizeof(struct virtio_net_hdr) + MAX_HDR];
 };
 
 static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
@@ -66,10 +66,8 @@ struct gro *gro_new(int tun_fd, size_t vnet_hdr_len, size_t mtu)
 	g->vnet_hdr_len = vnet_hdr_len;
 	g->mtu = mtu;
 	g->payload_cap = MAX_COALESCED;
-	g->out_cap = MAX_COALESCED + MAX_HDR + 32;
 	g->payload = malloc(g->payload_cap);
-	g->out = malloc(g->out_cap);
-	if (!g->payload || !g->out) {
+	if (!g->payload) {
 		gro_free(g);
 		return NULL;
 	}
@@ -81,7 +79,6 @@ void gro_free(struct gro *g)
 	if (!g)
 		return;
 	free(g->payload);
-	free(g->out);
 	free(g);
 }
 
@@ -161,7 +158,6 @@ static int emit(struct gro *g)
 
 	memcpy(out, &vh, sizeof(vh));
 	memcpy(out + g->vnet_hdr_len, g->hdr, g->hdr_len);
-	memcpy(out + g->vnet_hdr_len + g->hdr_len, g->payload, g->payload_len);
 
 	{
 		uint8_t *ip = out + g->vnet_hdr_len;
@@ -180,13 +176,22 @@ static int emit(struct gro *g)
 		}
 	}
 
-	g->open = 0;
-	g->payload_len = 0;
-	g->segments = 0;
-
+	/* Headers and payload as two pieces rather than copying up to 64 KiB
+	 * of payload in behind the headers first: the kernel gathers them in
+	 * the one copy it makes anyway. */
 	{
-		ssize_t n = write(g->tun_fd, out, g->vnet_hdr_len + total);
+		struct iovec iov[2];
+		ssize_t n;
 
+		iov[0].iov_base = out;
+		iov[0].iov_len = g->vnet_hdr_len + g->hdr_len;
+		iov[1].iov_base = g->payload;
+		iov[1].iov_len = g->payload_len;
+		n = writev(g->tun_fd, iov, 2);
+
+		g->open = 0;
+		g->payload_len = 0;
+		g->segments = 0;
 		return n < 0 ? -1 : 0;
 	}
 }

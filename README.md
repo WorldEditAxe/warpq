@@ -102,6 +102,47 @@ reconnects: 0
 
 Use `-s PATH` to move the socket, or `--no-ctl` on `up` to do without one.
 
+## Tunnel encryption
+
+mbedTLS does the handshake and checks the endpoint's pinned key. After that,
+`up` moves the tunnel's record encryption to something faster, best first:
+
+1. **The kernel's TLS layer (kTLS).** Its ChaCha20-Poly1305 and AES-GCM are
+   hand-tuned for each CPU, and it decrypts straight into warpq's buffers.
+   It needs the `tls` kernel module and the kernel's ChaCha20-Poly1305 AEAD;
+   on OpenWrt that is `kmod-tls` plus the ChaCha20-Poly1305 crypto module.
+2. **warpq's own record layer** (`src/aead.c`), for ChaCha20-Poly1305 when
+   the kernel can't take it. ChaCha20 runs four or eight blocks at a time
+   in SIMD registers: NEON on ARM, SSE2 or AVX2 (picked at run time) on x86,
+   AltiVec on POWER, LSX on LoongArch. Poly1305 uses 64x64-bit multiplies on
+   64-bit CPUs. Records move up to 64 KiB per system call.
+3. **mbedTLS**, for everything else (AES-GCM without kTLS, or TLS 1.2).
+
+The `tunnel up` line says which one is in use:
+
+```
+tunnel up: CONNECT accepted (HTTP/2, TLS1-3-CHACHA20-POLY1305-SHA256, kernel TLS)
+tunnel up: CONNECT accepted (HTTP/2, TLS1-3-CHACHA20-POLY1305-SHA256, warpq ChaCha20/NEON)
+```
+
+Measured with ChaCha20-Poly1305 on an i7-13700KF, with warpq held to a
+quarter of a core:
+
+| engine | download | upload | CPU per GB (down/up) |
+|--------|----------|--------|----------------------|
+| mbedTLS | 990 Mbit/s | 790 Mbit/s | 1.9 s / 2.4 s |
+| warpq (AVX2) | 1590 Mbit/s | 1430 Mbit/s | 1.1 s / 1.3 s |
+| kernel TLS | 1560 Mbit/s | 1350 Mbit/s | 1.2 s / 1.4 s |
+
+The cipher alone, sealing 16 KiB records, compared with stock mbedTLS:
+3.3x faster with AVX2 and 2x with SSE2 (i7-13700KF), 2.9x with NEON (Apple
+M2). On CPUs with no SIMD and no 64-bit multiply (MIPS32, ARMv5/v6) the
+cipher runs at mbedTLS's speed (measured on 32-bit x86 without SIMD); the
+gain there is the fewer system calls.
+
+`--tls-engine warpq` skips the kernel, and `--tls-engine mbedtls` keeps
+mbedTLS for the whole connection.
+
 ## LuCI
 
 `luci/` holds `luci-app-warpq`: a status panel (state, addresses, endpoint,
